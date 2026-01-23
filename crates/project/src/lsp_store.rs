@@ -69,8 +69,8 @@ use language::{
     language_settings::{FormatOnSave, Formatter, LanguageSettings, language_settings},
     point_to_lsp,
     proto::{
-        deserialize_anchor, deserialize_lsp_edit, deserialize_version, serialize_anchor,
-        serialize_lsp_edit, serialize_version,
+        deserialize_anchor, deserialize_anchor_range, deserialize_lsp_edit, deserialize_version,
+        serialize_anchor, serialize_anchor_range, serialize_lsp_edit, serialize_version,
     },
     range_from_lsp, range_to_lsp,
     row_chunk::RowChunk,
@@ -125,7 +125,7 @@ use text::{Anchor, BufferId, LineEnding, OffsetRangeExt, ToPoint as _};
 
 use util::{
     ConnectionResult, ResultExt as _, debug_panic, defer, maybe, merge_json_value_into,
-    paths::{PathStyle, SanitizedPath},
+    paths::{PathStyle, SanitizedPath, UrlExt},
     post_inc,
     redact::redact_command,
     rel_path::RelPath,
@@ -145,6 +145,7 @@ const SERVER_LAUNCHING_BEFORE_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5
 pub const SERVER_PROGRESS_THROTTLE_TIMEOUT: Duration = Duration::from_millis(100);
 const WORKSPACE_DIAGNOSTICS_TOKEN_START: &str = "id:";
 const SERVER_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(10);
+static NEXT_PROMPT_REQUEST_ID: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 pub enum ProgressToken {
@@ -1095,18 +1096,19 @@ impl LocalLspStore {
                     async move {
                         let actions = params.actions.unwrap_or_default();
                         let message = params.message.clone();
-                        let (tx, rx) = smol::channel::bounded(1);
-                        let request = LanguageServerPromptRequest {
-                            level: match params.typ {
-                                lsp::MessageType::ERROR => PromptLevel::Critical,
-                                lsp::MessageType::WARNING => PromptLevel::Warning,
-                                _ => PromptLevel::Info,
-                            },
-                            message: params.message,
-                            actions,
-                            response_channel: tx,
-                            lsp_name: name.clone(),
+                        let (tx, rx) = smol::channel::bounded::<MessageActionItem>(1);
+                        let level = match params.typ {
+                            lsp::MessageType::ERROR => PromptLevel::Critical,
+                            lsp::MessageType::WARNING => PromptLevel::Warning,
+                            _ => PromptLevel::Info,
                         };
+                        let request = LanguageServerPromptRequest::new(
+                            level,
+                            params.message,
+                            actions,
+                            name.clone(),
+                            tx,
+                        );
 
                         let did_update = this
                             .update(&mut cx, |_, cx| {
@@ -1141,17 +1143,13 @@ impl LocalLspStore {
                     let mut cx = cx.clone();
 
                     let (tx, _) = smol::channel::bounded(1);
-                    let request = LanguageServerPromptRequest {
-                        level: match params.typ {
-                            lsp::MessageType::ERROR => PromptLevel::Critical,
-                            lsp::MessageType::WARNING => PromptLevel::Warning,
-                            _ => PromptLevel::Info,
-                        },
-                        message: params.message,
-                        actions: vec![],
-                        response_channel: tx,
-                        lsp_name: name,
+                    let level = match params.typ {
+                        lsp::MessageType::ERROR => PromptLevel::Critical,
+                        lsp::MessageType::WARNING => PromptLevel::Warning,
+                        _ => PromptLevel::Info,
                     };
+                    let request =
+                        LanguageServerPromptRequest::new(level, params.message, vec![], name, tx);
 
                     let _ = this.update(&mut cx, |_, cx| {
                         cx.emit(LspStoreEvent::LanguageServerPrompt(request));
@@ -1649,7 +1647,7 @@ impl LocalLspStore {
 
                     let diff = Self::format_via_external_command(
                         buffer,
-                        command.as_ref(),
+                        &command,
                         arguments.as_deref(),
                         cx,
                     )
@@ -8721,13 +8719,14 @@ impl LspStore {
         language_server_id: LanguageServerId,
         cx: &mut Context<Self>,
     ) -> Task<Result<Entity<Buffer>>> {
+        let path_style = self.worktree_store.read(cx).path_style();
         cx.spawn(async move |lsp_store, cx| {
             // Escape percent-encoded string.
             let current_scheme = abs_path.scheme().to_owned();
             // Uri is immutable, so we can't modify the scheme
 
             let abs_path = abs_path
-                .to_file_path()
+                .to_file_path_ext(path_style)
                 .map_err(|()| anyhow!("can't convert URI to path"))?;
             let p = abs_path.clone();
             let yarn_worktree = lsp_store
@@ -10748,14 +10747,17 @@ impl LspStore {
         } else if let Some((client, project_id)) = self.upstream_client() {
             zlog::trace!(logger => "Formatting remotely");
             let logger = zlog::scoped!(logger => "remote");
-            // Don't support formatting ranges via remote
-            match target {
-                LspFormatTarget::Buffers => {}
-                LspFormatTarget::Ranges(_) => {
-                    zlog::trace!(logger => "Ignoring unsupported remote range formatting request");
-                    return Task::ready(Ok(ProjectTransaction::default()));
-                }
-            }
+
+            let buffer_ranges = match &target {
+                LspFormatTarget::Buffers => Vec::new(),
+                LspFormatTarget::Ranges(ranges) => ranges
+                    .iter()
+                    .map(|(buffer_id, ranges)| proto::BufferFormatRanges {
+                        buffer_id: buffer_id.to_proto(),
+                        ranges: ranges.iter().cloned().map(serialize_anchor_range).collect(),
+                    })
+                    .collect(),
+            };
 
             let buffer_store = self.buffer_store();
             cx.spawn(async move |lsp_store, cx| {
@@ -10769,6 +10771,7 @@ impl LspStore {
                             .iter()
                             .map(|buffer| buffer.read_with(cx, |buffer, _| buffer.remote_id().to_proto()))
                             .collect(),
+                        buffer_ranges,
                     })
                     .await
                     .and_then(|result| result.transaction.context("missing transaction"));
@@ -10810,8 +10813,27 @@ impl LspStore {
                 let buffer_id = BufferId::new(*buffer_id)?;
                 buffers.insert(this.buffer_store.read(cx).get_existing(buffer_id)?);
             }
+
+            let target = if envelope.payload.buffer_ranges.is_empty() {
+                LspFormatTarget::Buffers
+            } else {
+                let mut ranges_map = BTreeMap::new();
+                for buffer_range in &envelope.payload.buffer_ranges {
+                    let buffer_id = BufferId::new(buffer_range.buffer_id)?;
+                    let ranges: Result<Vec<_>> = buffer_range
+                        .ranges
+                        .iter()
+                        .map(|range| {
+                            deserialize_anchor_range(range.clone()).context("invalid anchor range")
+                        })
+                        .collect();
+                    ranges_map.insert(buffer_id, ranges?);
+                }
+                LspFormatTarget::Ranges(ranges_map)
+            };
+
             let trigger = FormatTrigger::from_proto(envelope.payload.trigger);
-            anyhow::Ok(this.format(buffers, LspFormatTarget::Buffers, false, trigger, cx))
+            anyhow::Ok(this.format(buffers, target, false, trigger, cx))
         })?;
 
         let project_transaction = format.await?;
@@ -11013,6 +11035,10 @@ impl LspStore {
     }
 
     pub fn stop_all_language_servers(&mut self, cx: &mut Context<Self>) {
+        self.shutdown_all_language_servers(cx).detach();
+    }
+
+    pub fn shutdown_all_language_servers(&mut self, cx: &mut Context<Self>) -> Task<()> {
         if let Some((client, project_id)) = self.upstream_client() {
             let request = client.request(proto::StopLanguageServers {
                 project_id,
@@ -11020,10 +11046,12 @@ impl LspStore {
                 also_servers: Vec::new(),
                 all: true,
             });
-            cx.background_spawn(request).detach_and_log_err(cx);
+            cx.background_spawn(async move {
+                request.await.ok();
+            })
         } else {
             let Some(local) = self.as_local_mut() else {
-                return;
+                return Task::ready(());
             };
             let language_servers_to_stop = local
                 .language_server_ids
@@ -11038,7 +11066,6 @@ impl LspStore {
             cx.background_spawn(async move {
                 futures::future::join_all(tasks).await;
             })
-            .detach();
         }
     }
 
@@ -13727,6 +13754,7 @@ struct LspBufferSnapshot {
 /// A prompt requested by LSP server.
 #[derive(Clone, Debug)]
 pub struct LanguageServerPromptRequest {
+    pub id: usize,
     pub level: PromptLevel,
     pub message: String,
     pub actions: Vec<MessageActionItem>,
@@ -13735,12 +13763,40 @@ pub struct LanguageServerPromptRequest {
 }
 
 impl LanguageServerPromptRequest {
+    pub fn new(
+        level: PromptLevel,
+        message: String,
+        actions: Vec<MessageActionItem>,
+        lsp_name: String,
+        response_channel: smol::channel::Sender<MessageActionItem>,
+    ) -> Self {
+        let id = NEXT_PROMPT_REQUEST_ID.fetch_add(1, atomic::Ordering::AcqRel);
+        LanguageServerPromptRequest {
+            id,
+            level,
+            message,
+            actions,
+            lsp_name,
+            response_channel,
+        }
+    }
     pub async fn respond(self, index: usize) -> Option<()> {
         if let Some(response) = self.actions.into_iter().nth(index) {
             self.response_channel.send(response).await.ok()
         } else {
             None
         }
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn test(
+        level: PromptLevel,
+        message: String,
+        actions: Vec<MessageActionItem>,
+        lsp_name: String,
+    ) -> Self {
+        let (tx, _rx) = smol::channel::unbounded();
+        LanguageServerPromptRequest::new(level, message, actions, lsp_name, tx)
     }
 }
 impl PartialEq for LanguageServerPromptRequest {
