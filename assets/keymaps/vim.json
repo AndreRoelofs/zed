@@ -67,6 +67,7 @@
       "ctrl-o": "pane::GoBack",
       "ctrl-i": "pane::GoForward",
       "ctrl-]": "editor::GoToDefinition",
+      "ctrl-t": "pane::GoToOlderTag",
       "escape": "vim::SwitchToNormalMode",
       "ctrl-[": "vim::SwitchToNormalMode",
       "v": "vim::ToggleVisual",
@@ -1107,6 +1108,14 @@
       "k": "menu::SelectPrevious",
       "g g": "menu::SelectFirst",
       "shift-g": "menu::SelectLast",
+    },
+  },
+  {
+    "context": "NotebookEditor > Editor && VimControl && vim_mode == normal",
+
+    "bindings": {
+      "j": "notebook::NotebookMoveDown",
+      "k": "notebook::NotebookMoveUp",
     },
   },
 ]

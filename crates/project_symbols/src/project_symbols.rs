@@ -61,9 +61,10 @@ impl ProjectSymbolsDelegate {
         }
     }
 
+    // Note if you make changes to this, also change `agent_ui::completion_provider::search_symbols`
     fn filter(&mut self, query: &str, window: &mut Window, cx: &mut Context<Picker<Self>>) {
         const MAX_MATCHES: usize = 100;
-        let mut visible_matches = cx.background_executor().block(fuzzy::match_strings(
+        let mut visible_matches = cx.foreground_executor().block_on(fuzzy::match_strings(
             &self.visible_match_candidates,
             query,
             false,
@@ -72,7 +73,7 @@ impl ProjectSymbolsDelegate {
             &Default::default(),
             cx.background_executor().clone(),
         ));
-        let mut external_matches = cx.background_executor().block(fuzzy::match_strings(
+        let mut external_matches = cx.foreground_executor().block_on(fuzzy::match_strings(
             &self.external_match_candidates,
             query,
             false,
@@ -317,6 +318,7 @@ mod tests {
     use settings::SettingsStore;
     use std::{path::Path, sync::Arc};
     use util::path;
+    use workspace::MultiWorkspace;
 
     #[gpui::test]
     async fn test_project_symbols(cx: &mut TestAppContext) {
@@ -408,8 +410,9 @@ mod tests {
             },
         );
 
-        let (workspace, cx) =
-            cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
 
         // Create the project symbols view.
         let symbols = cx.new_window_entity(|window, cx| {

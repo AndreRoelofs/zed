@@ -86,10 +86,6 @@ enum OpenBuffer {
 
 pub enum BufferStoreEvent {
     BufferAdded(Entity<Buffer>),
-    BufferOpened {
-        buffer: Entity<Buffer>,
-        project_path: ProjectPath,
-    },
     SharedBufferClosed(proto::PeerId, BufferId),
     BufferDropped(BufferId),
     BufferChangedFilePath {
@@ -331,6 +327,7 @@ impl RemoteBufferStore {
 
     fn create_buffer(
         &self,
+        language: Option<Arc<Language>>,
         project_searchable: bool,
         cx: &mut Context<BufferStore>,
     ) -> Task<Result<Entity<Buffer>>> {
@@ -341,13 +338,20 @@ impl RemoteBufferStore {
             let response = create.await?;
             let buffer_id = BufferId::new(response.buffer_id)?;
 
-            this.update(cx, |this, cx| {
-                if !project_searchable {
-                    this.non_searchable_buffers.insert(buffer_id);
-                }
-                this.wait_for_remote_buffer(buffer_id, cx)
-            })?
-            .await
+            let buffer = this
+                .update(cx, |this, cx| {
+                    if !project_searchable {
+                        this.non_searchable_buffers.insert(buffer_id);
+                    }
+                    this.wait_for_remote_buffer(buffer_id, cx)
+                })?
+                .await?;
+            if let Some(language) = language {
+                buffer.update(cx, |buffer, cx| {
+                    buffer.set_language(Some(language), cx);
+                });
+            }
+            Ok(buffer)
         })
     }
 
@@ -523,7 +527,10 @@ impl LocalBufferStore {
             let new_file = if let Some(entry) = snapshot_entry {
                 File {
                     disk_state: match entry.mtime {
-                        Some(mtime) => DiskState::Present { mtime },
+                        Some(mtime) => DiskState::Present {
+                            mtime,
+                            size: entry.size,
+                        },
                         None => old_file.disk_state,
                     },
                     is_local: true,
@@ -626,6 +633,7 @@ impl LocalBufferStore {
         self.save_local_buffer(buffer, worktree, path.path, true, cx)
     }
 
+    #[ztracing::instrument(skip_all)]
     fn open_buffer(
         &self,
         path: Arc<RelPath>,
@@ -710,12 +718,15 @@ impl LocalBufferStore {
 
     fn create_buffer(
         &self,
+        language: Option<Arc<Language>>,
         project_searchable: bool,
         cx: &mut Context<BufferStore>,
     ) -> Task<Result<Entity<Buffer>>> {
         cx.spawn(async move |buffer_store, cx| {
-            let buffer =
-                cx.new(|cx| Buffer::local("", cx).with_language(language::PLAIN_TEXT.clone(), cx));
+            let buffer = cx.new(|cx| {
+                Buffer::local("", cx)
+                    .with_language(language.unwrap_or_else(|| language::PLAIN_TEXT.clone()), cx)
+            });
             buffer_store.update(cx, |buffer_store, cx| {
                 buffer_store.add_buffer(buffer.clone(), cx).log_err();
                 if !project_searchable {
@@ -833,17 +844,13 @@ impl BufferStore {
         }
     }
 
+    #[ztracing::instrument(skip_all)]
     pub fn open_buffer(
         &mut self,
         project_path: ProjectPath,
         cx: &mut Context<Self>,
     ) -> Task<Result<Entity<Buffer>>> {
         if let Some(buffer) = self.get_by_path(&project_path) {
-            cx.emit(BufferStoreEvent::BufferOpened {
-                buffer: buffer.clone(),
-                project_path,
-            });
-
             return Task::ready(Ok(buffer));
         }
 
@@ -865,19 +872,13 @@ impl BufferStore {
 
                 entry
                     .insert(
-                        // todo(lw): hot foreground spawn
                         cx.spawn(async move |this, cx| {
                             let load_result = load_buffer.await;
-                            this.update(cx, |this, cx| {
+                            this.update(cx, |this, _cx| {
                                 // Record the fact that the buffer is no longer loading.
                                 this.loading_buffers.remove(&project_path);
 
                                 let buffer = load_result.map_err(Arc::new)?;
-                                cx.emit(BufferStoreEvent::BufferOpened {
-                                    buffer: buffer.clone(),
-                                    project_path,
-                                });
-
                                 Ok(buffer)
                             })?
                         })
@@ -900,12 +901,13 @@ impl BufferStore {
 
     pub fn create_buffer(
         &mut self,
+        language: Option<Arc<Language>>,
         project_searchable: bool,
         cx: &mut Context<Self>,
     ) -> Task<Result<Entity<Buffer>>> {
         match &self.state {
-            BufferStoreState::Local(this) => this.create_buffer(project_searchable, cx),
-            BufferStoreState::Remote(this) => this.create_buffer(project_searchable, cx),
+            BufferStoreState::Local(this) => this.create_buffer(language, project_searchable, cx),
+            BufferStoreState::Remote(this) => this.create_buffer(language, project_searchable, cx),
         }
     }
 

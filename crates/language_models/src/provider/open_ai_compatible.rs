@@ -319,6 +319,14 @@ impl LanguageModel for OpenAiCompatibleLanguageModel {
         }
     }
 
+    fn supports_streaming_tools(&self) -> bool {
+        true
+    }
+
+    fn supports_split_token_display(&self) -> bool {
+        true
+    }
+
     fn telemetry_id(&self) -> String {
         format!("openai/{}", self.model.name)
     }
