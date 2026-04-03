@@ -2831,16 +2831,9 @@ impl Pane {
                 move |pane: &mut Self, event: &ClickEvent, window, cx| {
                     if event.click_count() > 1 {
                         pane.unpreview_item_if_preview(item_id);
-                        let extra_actions = item_handle.tab_extra_context_menu_actions(window, cx);
-                        if let Some((_, action)) = extra_actions
-                            .into_iter()
-                            .find(|(label, _)| label.as_ref() == "Rename")
-                        {
-                            // Dispatch action directly through the focus handle to avoid
-                            // relay_action's intermediate focus step which can interfere
-                            // with inline editors.
-                            let focus_handle = item_handle.item_focus_handle(cx);
-                            focus_handle.dispatch_action(&*action, window, cx);
+                        let extra_items = item_handle.tab_extra_context_menu_items(window, cx);
+                        if let Some(item) = extra_items.into_iter().find(|item| item.is_rename) {
+                            (item.handler)(window, cx);
                             return;
                         }
                     }
@@ -3015,7 +3008,7 @@ impl Pane {
             .menu(move |window, cx| {
                 let pane = pane.clone();
                 let menu_context = menu_context.clone();
-                let extra_actions = item_handle.tab_extra_context_menu_actions(window, cx);
+                let extra_items = item_handle.tab_extra_context_menu_items(window, cx);
                 ContextMenu::build(window, cx, move |mut menu, window, cx| {
                     let close_active_item_action = CloseActiveItem {
                         save_intent: None,
@@ -3303,10 +3296,12 @@ impl Pane {
                     };
 
                     // Add custom item-specific actions
-                    if !extra_actions.is_empty() {
+                    if !extra_items.is_empty() {
                         menu = menu.separator();
-                        for (label, action) in extra_actions {
-                            menu = menu.action(label, action);
+                        for item in extra_items {
+                            menu = menu.entry(item.label, item.action, move |window, cx| {
+                                (item.handler)(window, cx);
+                            });
                         }
                     }
 

@@ -1079,12 +1079,12 @@ impl Item for Editor {
         }
     }
 
-    fn tab_extra_context_menu_actions(
+    fn tab_extra_context_menu_items(
         &self,
         _window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> Vec<(SharedString, Box<dyn gpui::Action>)> {
-        let mut actions = Vec::new();
+    ) -> Vec<workspace::item::TabContextMenuItem> {
+        let mut items = Vec::new();
 
         let is_markdown = self
             .buffer()
@@ -1104,21 +1104,31 @@ impl Item for Editor {
                     .is_some_and(|ext| ext.eq_ignore_ascii_case("svg"))
             });
 
+        let focus_handle = self.focus_handle.clone();
         if is_markdown {
-            actions.push((
-                "Open Markdown Preview".into(),
-                Box::new(OpenMarkdownPreview) as Box<dyn gpui::Action>,
-            ));
+            let focus_handle = focus_handle.clone();
+            items.push(workspace::item::TabContextMenuItem {
+                label: "Open Markdown Preview".into(),
+                action: Some(Box::new(OpenMarkdownPreview)),
+                handler: Box::new(move |window, cx| {
+                    focus_handle.dispatch_action(&OpenMarkdownPreview, window, cx);
+                }),
+                is_rename: false,
+            });
         }
 
         if is_svg {
-            actions.push((
-                "Open SVG Preview".into(),
-                Box::new(OpenSvgPreview) as Box<dyn gpui::Action>,
-            ));
+            items.push(workspace::item::TabContextMenuItem {
+                label: "Open SVG Preview".into(),
+                action: Some(Box::new(OpenSvgPreview)),
+                handler: Box::new(move |window, cx| {
+                    focus_handle.dispatch_action(&OpenSvgPreview, window, cx);
+                }),
+                is_rename: false,
+            });
         }
 
-        actions
+        items
     }
 
     fn preserve_preview(&self, cx: &App) -> bool {

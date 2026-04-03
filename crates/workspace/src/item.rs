@@ -36,6 +36,13 @@ use util::ResultExt;
 
 pub const LEADER_UPDATE_THROTTLE: Duration = Duration::from_millis(200);
 
+pub struct TabContextMenuItem {
+    pub label: SharedString,
+    pub action: Option<Box<dyn Action>>,
+    pub handler: Box<dyn Fn(&mut Window, &mut App) + 'static>,
+    pub is_rename: bool,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct SaveOptions {
     pub format: bool,
@@ -370,13 +377,12 @@ pub trait Item: Focusable + EventEmitter<Self::Event> + Render + Sized {
         false
     }
 
-    /// Returns additional actions to add to the tab's context menu.
-    /// Each entry is a label and an action to dispatch.
-    fn tab_extra_context_menu_actions(
+    /// Returns additional entries to add to the tab's context menu.
+    fn tab_extra_context_menu_items(
         &self,
         _window: &mut Window,
         _cx: &mut Context<Self>,
-    ) -> Vec<(SharedString, Box<dyn Action>)> {
+    ) -> Vec<TabContextMenuItem> {
         Vec::new()
     }
 }
@@ -556,11 +562,11 @@ pub trait ItemHandle: 'static + Send {
         window: &mut Window,
         cx: &mut App,
     ) -> bool;
-    fn tab_extra_context_menu_actions(
+    fn tab_extra_context_menu_items(
         &self,
         window: &mut Window,
         cx: &mut App,
-    ) -> Vec<(SharedString, Box<dyn Action>)>;
+    ) -> Vec<TabContextMenuItem>;
     fn can_autosave(&self, cx: &App) -> bool {
         let is_deleted = self.project_entry_ids(cx).is_empty();
         self.is_dirty(cx) && !self.has_conflict(cx) && self.can_save(cx) && !is_deleted
@@ -1149,14 +1155,12 @@ impl<T: Item> ItemHandle for Entity<T> {
         })
     }
 
-    fn tab_extra_context_menu_actions(
+    fn tab_extra_context_menu_items(
         &self,
         window: &mut Window,
         cx: &mut App,
-    ) -> Vec<(SharedString, Box<dyn Action>)> {
-        self.update(cx, |this, cx| {
-            this.tab_extra_context_menu_actions(window, cx)
-        })
+    ) -> Vec<TabContextMenuItem> {
+        self.update(cx, |this, cx| this.tab_extra_context_menu_items(window, cx))
     }
 }
 

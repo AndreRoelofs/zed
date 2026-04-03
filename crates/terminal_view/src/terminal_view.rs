@@ -1350,16 +1350,9 @@ impl Item for TerminalView {
             None => (IconName::Terminal, Color::Muted, None),
         };
 
-        let self_handle = self.self_handle.clone();
         h_flex()
             .gap_1()
             .group("term-tab-icon")
-            .track_focus(&self.focus_handle)
-            .on_action(move |action: &RenameTerminal, window, cx| {
-                self_handle
-                    .update(cx, |this, cx| this.rename_terminal(action, window, cx))
-                    .ok();
-            })
             .child(
                 h_flex()
                     .group("term-tab-icon")
@@ -1577,14 +1570,26 @@ impl Item for TerminalView {
         false
     }
 
-    fn tab_extra_context_menu_actions(
+    fn tab_extra_context_menu_items(
         &self,
         _window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> Vec<(SharedString, Box<dyn gpui::Action>)> {
+    ) -> Vec<workspace::item::TabContextMenuItem> {
         let terminal = self.terminal.read(cx);
         if terminal.task().is_none() {
-            vec![("Rename".into(), Box::new(RenameTerminal))]
+            let self_handle = self.self_handle.clone();
+            vec![workspace::item::TabContextMenuItem {
+                label: "Rename".into(),
+                action: Some(Box::new(RenameTerminal)),
+                handler: Box::new(move |window, cx| {
+                    self_handle
+                        .update(cx, |this, cx| {
+                            this.rename_terminal(&RenameTerminal, window, cx);
+                        })
+                        .log_err();
+                }),
+                is_rename: true,
+            }]
         } else {
             Vec::new()
         }
